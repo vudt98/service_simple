@@ -4,10 +4,15 @@ import android.annotation.SuppressLint
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
+import android.graphics.*
+import android.net.TrafficStats
 import android.os.Binder
 import android.os.IBinder
+import android.widget.RemoteViews
 import android.widget.Toast
+import androidx.core.app.NotificationCompat
+import androidx.core.graphics.drawable.IconCompat
+import com.example.myapplication.utils.Speed
 import kotlinx.coroutines.*
 
 
@@ -17,8 +22,22 @@ class ServiceTest : Service() {
 
     private var notificationManager: NotificationManager? = null
 
-    private var notification: Notification.Builder? = null
+    private var notification: NotificationCompat.Builder? = null
     private var job: Job? = null
+
+    private var contentView: RemoteViews? = null
+
+    private var mSpeed: Speed? = null
+
+    private var mIconCanvas: Canvas? = null
+
+    private var mLastRxBytes: Long = 0
+    private var mLastTxBytes: Long = 0
+    private var mLastTime: Long = 0
+
+    private lateinit var mIconBitmap: Bitmap
+    private lateinit var mIconSpeedPaint: Paint
+    private lateinit var mIconUnitPaint: Paint
 
     private val coroutineScope = CoroutineScope(Dispatchers.IO)
 
@@ -30,9 +49,24 @@ class ServiceTest : Service() {
         fun getService() = this@ServiceTest
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        mLastRxBytes = TrafficStats.getTotalRxBytes()
+        mLastTxBytes = TrafficStats.getTotalTxBytes()
+        mLastTime = System.currentTimeMillis()
+        mSpeed = Speed(this)
+        mIconBitmap = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888);
+        mIconCanvas = Canvas(mIconBitmap)
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Toast.makeText(this, "Service Start", Toast.LENGTH_SHORT).show()
-        getNotification(this)
+        if (intent?.action == "stop") {
+            stopForeground(true)
+            stopSelf()
+        } else {
+            Toast.makeText(this, "Service Start", Toast.LENGTH_SHORT).show()
+            getNotification(this)
+        }
         return START_STICKY
     }
 
@@ -58,9 +92,11 @@ class ServiceTest : Service() {
         }
     }
 
-    @SuppressLint("UnspecifiedImmutableFlag")
+    @SuppressLint("UnspecifiedImmutableFlag", "RemoteViewLayout")
     private fun getNotification(context: Context) {
         createChannel(context)
+
+        setupIcon()
 
         notificationManager =
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -71,13 +107,15 @@ class ServiceTest : Service() {
 
         job = coroutineScope.launch {
             repeat(Int.MAX_VALUE) {
-                if (it == 20) {
+                if (it == -1) {
                     job?.cancel()
                 }
                 ensureActive()
                 delay(1000)
+                getData()
+                val data = mSpeed?.getHumanSpeed("indicatorSpeedToShow")
                 message = (message.toInt().plus(1)).toString()
-                updateNotice(message)
+                updateNotice(message, data!!)
             }
         }
 
@@ -91,26 +129,67 @@ class ServiceTest : Service() {
         val pendingIntent =
             PendingIntent.getActivity(context, 0, notifyIntent, PendingIntent.FLAG_UPDATE_CURRENT)
 
-        val deleteIntent = Intent(this, ServiceTest::class.java)
-//        val deletePendingIntent = PendingIntent.getService(
-//            this,
-//            0,
-//            deleteIntent,
-//            PendingIntent.FLAG_CANCEL_CURRENT
-//        )
+        contentView = RemoteViews(packageName, R.layout.layout_notice)
+        contentView?.setTextViewText(R.id.count, message)
 
-        notification = Notification.Builder(context, CHANNEL_ID)
+        notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setContentIntent(pendingIntent)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setCustomContentView(contentView)
+            .setSmallIcon(getIndicatorIcon("", "")!!)
             .setAutoCancel(true)
-            .setContentText(message)
-//            .setDeleteIntent(deletePendingIntent)
+            .setContent(contentView)
 
         startForeground(NOTICE_ID, notification?.build())
     }
 
-    private fun updateNotice(message: String) {
-        notification?.setContentText(message)
+    private fun updateNotice(message: String, data: Speed.HumanSpeed) {
+        notification?.setSmallIcon(
+            getIndicatorIcon(data.speedValue.toString(), data.speedUnit.toString())!!
+        )
+        contentView?.setTextViewText(R.id.downSp, "${data.speedValue} ${data.speedUnit}")
+        contentView?.setTextViewText(R.id.upSp, "${data.speedUnit}")
+        contentView?.setTextViewText(R.id.count, message)
         notificationManager?.notify(NOTICE_ID, notification?.build())
+    }
+
+    override fun onDestroy() {
+        coroutineScope.cancel()
+        super.onDestroy()
+    }
+
+    private fun getData() {
+        val currentRxBytes = TrafficStats.getTotalRxBytes()
+        val currentTxBytes = TrafficStats.getTotalTxBytes()
+        val usedRxBytes = currentRxBytes - mLastRxBytes
+        val usedTxBytes = currentTxBytes - mLastTxBytes
+        val currentTime = System.currentTimeMillis()
+        val usedTime = currentTime - mLastTime
+        mLastRxBytes = currentRxBytes
+        mLastTxBytes = currentTxBytes
+        mLastTime = currentTime
+        mSpeed!!.calcSpeed(usedTime, usedRxBytes, usedTxBytes)
+    }
+
+    private fun getIndicatorIcon(speedValue: String, speedUnit: String): IconCompat? {
+        mIconCanvas?.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+        mIconCanvas?.drawText(speedValue, 48F, 52F, mIconSpeedPaint)
+        mIconCanvas?.drawText(speedUnit, 48F, 95F, mIconUnitPaint)
+        return IconCompat.createWithBitmap(mIconBitmap)
+    }
+
+    private fun setupIcon() {
+        mIconSpeedPaint = Paint()
+        mIconSpeedPaint.color = Color.WHITE
+        mIconSpeedPaint.isAntiAlias = true
+        mIconSpeedPaint.textSize = 65F
+        mIconSpeedPaint.textAlign = Paint.Align.CENTER
+        mIconSpeedPaint.typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+
+        mIconUnitPaint = Paint()
+        mIconUnitPaint.color = Color.WHITE
+        mIconUnitPaint.isAntiAlias = true
+        mIconUnitPaint.textSize = 40F
+        mIconUnitPaint.textAlign = Paint.Align.CENTER
+        mIconUnitPaint.typeface = Typeface.DEFAULT_BOLD
     }
 }
